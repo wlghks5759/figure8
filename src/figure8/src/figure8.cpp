@@ -336,7 +336,7 @@ class Figure8 : public rclcpp::Node {
                     curr = current_relative_altitude_m_;
                 }
                 RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 500, "Current altitude: %.2f m", curr);
-                if (curr >= height * 0.98f) { // 95% 도달 시
+                if (curr >= height * 0.98f) {
                     RCLCPP_INFO(this->get_logger(), "Takeoff complete. Reached altitude: %.2f m", curr);
                     break;
                     }
@@ -385,8 +385,12 @@ class Figure8 : public rclcpp::Node {
 
                 offboard_->set_position_ned(target_point);
                 
-                RCLCPP_INFO(this->get_logger(), "Setpoint %zu: North=%.2f, East=%.2f, Down=%.2f, Yaw=%.2f",
-                            curr_idx, target_point.north_m, target_point.east_m, target_point.down_m, target_point.yaw_deg);
+                RCLCPP_INFO_THROTTLE(
+                    this->get_logger(), 
+                    *this->get_clock(), 
+                    1000, 
+                    "Setpoint %zu: North=%.2f, East=%.2f, Down=%.2f, Yaw=%.2f",
+                    curr_idx, target_point.north_m, target_point.east_m, target_point.down_m, target_point.yaw_deg);
 
                 float distance_to_target = std::sqrt(
                     std::pow(current_n - target_point.north_m, 2) +
@@ -398,14 +402,13 @@ class Figure8 : public rclcpp::Node {
                 if (distance_to_target < acceptance_radius) {
                     RCLCPP_INFO(this->get_logger(), "Reached setpoint %zu", curr_idx);
 
-                    std::this_thread::sleep_for(std::chrono::milliseconds(500)); 
+                    std::this_thread::sleep_for(std::chrono::milliseconds(150)); 
                     curr_idx++;
 
                     if (curr_idx >= figure8_path_.size()) {
                         RCLCPP_INFO(this->get_logger(), "Completed one Figure 8 cycle. Restarting from beginning.");
                         curr_idx = 0; 
                     }
-                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 }
 
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
