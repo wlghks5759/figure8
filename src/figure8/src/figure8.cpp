@@ -35,6 +35,7 @@ double calculate_distance_haversine(double lat1, double lon1, double lat2, doubl
 }
 
 // 두 GPS 좌표 간의 방위각 계산 (초기 방위각)
+// 두 GPS 좌표 간의 방위각 계산 (초기 방위각)
 double calculate_bearing(double lat1_deg, double lon1_deg, double lat2_deg, double lon2_deg) {
 
 
@@ -58,6 +59,7 @@ double calculate_bearing(double lat1_deg, double lon1_deg, double lat2_deg, doub
 
     return bearing_deg_calc;
 }
+
 
 void convert_global_to_ned(double home_lat_deg, double home_lon_deg,
                            double current_lat_deg, double current_lon_deg,
@@ -92,7 +94,7 @@ class Figure8 : public rclcpp::Node {
             this->declare_parameter<double>("duration", 0.0);
             this->declare_parameter<double>("height", 10.0);
             this->declare_parameter<double>("speed", 1.0);
-            this->declare_parameter<double>("acceptance_radius", 0.5);
+            this->declare_parameter<double>("acceptance_radius", 2.0);
 
             omega_val = this->get_parameter("omega").as_double();
             double calculated_duration = ((2.0 * M_PI) / omega_val) * 2;
@@ -121,6 +123,20 @@ class Figure8 : public rclcpp::Node {
         }
 
     private:
+
+        enum class MissionState {
+            INITIAL,
+            PRE_FLIGHT_CHECKS,
+            ARMING,
+            TAKING_OFF,
+            STARTING_OFFBOARD,
+            FLYING_FIGURE8,
+            LANDING,
+            FINISHED
+        };
+        
+        MissionState current_state_ = MissionState::INITIAL;
+        
         // 타입정의 부분
         std::thread mission_thread_;
         std::string connection_url;
@@ -196,65 +212,45 @@ class Figure8 : public rclcpp::Node {
 
         // 작동과정
         void run_mission() {
+            // --- 1. MAVSDK 초기화 및 연결 ---
             mavsdk_ = std::make_shared<mavsdk::Mavsdk>(mavsdk::Mavsdk::Configuration{mavsdk::ComponentType::GroundStation});
-
-            // MAVSDK 연결
             mavsdk::ConnectionResult connection_result = mavsdk_->add_any_connection(connection_url);
-
             if (connection_result != mavsdk::ConnectionResult::Success) {
-                std::stringstream ss;
-                ss << connection_result; // 스트림 연산자를 사용하여 ss에 문자열 형태로 기록
-                RCLCPP_ERROR(this->get_logger(), "Connection failed: %s", ss.str().c_str()); // ss.str()은 std::string을 반환, .c_str()로 C-문자열 포인터 획득
+                RCLCPP_ERROR(this->get_logger(), "Connection failed");
                 rclcpp::shutdown();
                 return;
             }
             RCLCPP_INFO(this->get_logger(), "MAVSDK connection established.");
 
-
-
-            // 시스템 발견 대기
-            RCLCPP_INFO(this->get_logger(), "Waiting for system to connect...");
+            // --- 2. 시스템 발견 및 플러그인 초기화 ---
             auto discovered_system_promise = std::promise<std::shared_ptr<mavsdk::System>>();
             auto discovered_system_future = discovered_system_promise.get_future();
-
-
-            mavsdk::Action::Result arm_result;
-            mavsdk::Action::Result takeoff_result;
-            mavsdk::Offboard::Result offboard_start_result;
-            mavsdk::Offboard::VelocityNedYaw initial_setpoint{};
-            
-            size_t curr_idx = 0;
-
-
-
-
             mavsdk_->subscribe_on_new_system([this, &discovered_system_promise]() {
-                const auto systems = mavsdk_->systems();
-                if (!systems.empty()) {
+                if (!mavsdk_->systems().empty()) {
                     RCLCPP_INFO(this->get_logger(), "System discovered!");
-                    discovered_system_promise.set_value(systems.front());
-                    mavsdk_->subscribe_on_new_system(nullptr); // Unsubscribe
+                    discovered_system_promise.set_value(mavsdk_->systems().front());
+                    mavsdk_->subscribe_on_new_system(nullptr);
                 }
             });
-
             if (discovered_system_future.wait_for(std::chrono::seconds(10)) == std::future_status::timeout) {
                 RCLCPP_ERROR(this->get_logger(), "No system discovered in 10 seconds.");
                 rclcpp::shutdown();
                 return;
             }
             system_ = discovered_system_future.get();
-
             action_ = std::make_shared<mavsdk::Action>(system_);
             telemetry_ = std::make_shared<mavsdk::Telemetry>(system_);
             offboard_ = std::make_shared<mavsdk::Offboard>(system_);
 
-            // 텔레메트리 구독 (홈 위치, 현재 위치 등)
+            // --- 3. 텔레메트리 구독 ---
+            // 이 부분은 기존 코드와 동일해야 합니다. 이미 작성되어 있다면 수정할 필요 없습니다.
             telemetry_->subscribe_health_all_ok([this](bool all_ok){
                 if(!initial_health_ok_ && all_ok) {
                     RCLCPP_INFO(this->get_logger(), "System health is OK.");
                     initial_health_ok_ = true;
                 } else if (initial_health_ok_ && !all_ok) {
                     RCLCPP_WARN(this->get_logger(), "System health problem detected!");
+                    // 필요하다면 여기서 emergency_triggered_ 플래그를 설정할 수 있습니다.
                 }
             });
 
@@ -263,14 +259,13 @@ class Figure8 : public rclcpp::Node {
                     home_latitude_ = home_pos.latitude_deg;
                     home_longitude_ = home_pos.longitude_deg;
                     home_absolute_altitude_m_ = home_pos.absolute_altitude_m;
-                    home_relative_altitude_m_ = home_pos.relative_altitude_m; // Should be 0 at home
+                    home_relative_altitude_m_ = home_pos.relative_altitude_m;
                     home_position_set_ = true;
                     RCLCPP_INFO(this->get_logger(), "Home position set: Lat=%.7f, Lon=%.7f, AbsAlt=%.2fm",
                                 home_latitude_, home_longitude_, home_absolute_altitude_m_);
                     }
             });
 
-            // current GPS
             telemetry_->subscribe_position([this](mavsdk::Telemetry::Position position) {
                 std::lock_guard<std::mutex> lock(position_mutex_);
                 current_latitude_ = position.latitude_deg;
@@ -278,193 +273,230 @@ class Figure8 : public rclcpp::Node {
                 current_relative_altitude_m_ = position.relative_altitude_m;
                 current_absolute_altitude_m_ = position.absolute_altitude_m;
 
-                //lat, lon to NED
                 if (home_position_set_) { 
                     double north_tmp, east_tmp;
                     convert_global_to_ned(home_latitude_, home_longitude_,
-                                          current_latitude_, current_longitude_,
-                                          north_tmp, east_tmp);
+                                        current_latitude_, current_longitude_,
+                                        north_tmp, east_tmp);
                     current_north_m_ = static_cast<float>(north_tmp);
                     current_east_m_ = static_cast<float>(east_tmp);
-                    // Down은 상대 고도의 음수값 (NED 좌표계의 Down은 아래가 양수)
                     current_down_m_ = -current_relative_altitude_m_;
                 }
             });
 
 
+            // --- 4. 메인 제어 루프 (상태 머신) ---
+            current_state_ = MissionState::PRE_FLIGHT_CHECKS;
+            size_t figure8_idx = 0;
 
-            // 1. Pre-flight checks
-            RCLCPP_INFO(this->get_logger(), "Waiting for vehicle to have a GPS fix and home position...");
-            while (!telemetry_->health_all_ok() || !home_position_set_) {
-                if (emergency_triggered_) { RCLCPP_WARN(this->get_logger(), "Emergency triggered during pre-flight checks. Aborting."); return; }
-                RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "Waiting for GPS fix and home position...");
-                std::this_thread::sleep_for(std::chrono::seconds(1));
-            }
-            RCLCPP_INFO(this->get_logger(), "GPS fix and home position acquired.");
-
-
-            // 2. Arm
-            RCLCPP_INFO(this->get_logger(), "Arming...");
-            arm_result = action_->arm();
-            if (arm_result != mavsdk::Action::Result::Success) {
-                RCLCPP_ERROR(this->get_logger(), "Arming failed");
-                goto land_sequence; // 실패 시 착륙 시도
-            }
-            RCLCPP_INFO(this->get_logger(), "Armed.");
-
-            
-            // 3. Takeoff
-            RCLCPP_INFO(this->get_logger(), "Setting takeoff altitude to %.2f m", height);
-            action_->set_takeoff_altitude(height);
-            RCLCPP_INFO(this->get_logger(), "Taking off...");
-            takeoff_result = action_->takeoff();
-            if (takeoff_result != mavsdk::Action::Result::Success) {
-                RCLCPP_ERROR(this->get_logger(), "Takeoff failed");
-                goto land_sequence; // 실패 시 착륙 시도
-            }
-
-
-            while (true) {
-                if (emergency_triggered_) {RCLCPP_WARN(this->get_logger(), "Emergency triggered during takeoff. Attempting to land."); 
-                    action_->land();
-                    rclcpp::shutdown();
-                    return;
-                }
-                float curr;
-                {
-                    std::lock_guard<std::mutex> lock(position_mutex_);
-                    curr = current_relative_altitude_m_;
-                }
-                RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 500, "Current altitude: %.2f m", curr);
-                if (curr >= height * 0.98f) {
-                    RCLCPP_INFO(this->get_logger(), "Takeoff complete. Reached altitude: %.2f m", curr);
-                    break;
-                    }
-                std::this_thread::sleep_for(std::chrono::milliseconds(500));
-            }
-            if (emergency_triggered_) {
-            // 비상 착륙 코드
-            RCLCPP_INFO(this->get_logger(), "Emergency triggered, initiating landing sequence");
-            }
-
-            // 4. Offboard mode
-            RCLCPP_INFO(this->get_logger(), "Preparing for Offboard mode to target...");
-            figure8_path_generator();
-
-            
-            initial_setpoint.north_m_s = 0.0f;
-            initial_setpoint.east_m_s = 0.0f;
-            initial_setpoint.down_m_s = 0.0f;
-            initial_setpoint.yaw_deg = telemetry_->attitude_euler().yaw_deg;
-            offboard_->set_velocity_ned(initial_setpoint);
-            RCLCPP_INFO(this->get_logger(), "Initial setpoint sent (hover).");
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
-            offboard_start_result = offboard_->start();
-            if (offboard_start_result != mavsdk::Offboard::Result::Success) {
-                RCLCPP_ERROR(this->get_logger(), "Offboard start failed");
-                goto land_sequence; // 실패 시 착륙 시도
-                }
-
-            RCLCPP_INFO(this->get_logger(), "Offboard mode started.");
-
-
-            // Offboard 모드로 이동
-            while (rclcpp::ok() && !emergency_triggered_) {
-
-                // 목표 위치 설정
-                const auto& target_point = figure8_path_[curr_idx];
-
-                float current_n, current_e, current_d;
-                {
-                    std::lock_guard<std::mutex> lock(position_mutex_);
-                    current_n = current_north_m_;
-                    current_e = current_east_m_;
-                    current_d = current_down_m_;
-                }
-
-                offboard_->set_position_ned(target_point);
+            while (current_state_ != MissionState::FINISHED && rclcpp::ok() && !emergency_triggered_) {
                 
-                RCLCPP_INFO_THROTTLE(
-                    this->get_logger(), 
-                    *this->get_clock(), 
-                    1000, 
-                    "Setpoint %zu: North=%.2f, East=%.2f, Down=%.2f, Yaw=%.2f",
-                    curr_idx, target_point.north_m, target_point.east_m, target_point.down_m, target_point.yaw_deg);
+                switch (current_state_) {
+                    case MissionState::PRE_FLIGHT_CHECKS:
+                        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "State: PRE_FLIGHT_CHECKS");
+                        if (telemetry_->health_all_ok() && home_position_set_) {
+                            RCLCPP_INFO(this->get_logger(), "GPS fix and home position acquired.");
+                            current_state_ = MissionState::ARMING;
+                        }
+                        break;
 
-                float distance_to_target = std::sqrt(
-                    std::pow(current_n - target_point.north_m, 2) +
-                    std::pow(current_e - target_point.east_m, 2) +
-                    std::pow(current_d - target_point.down_m, 2) // 고도도 포함하여 3D 거리 계산
-                );
+                    case MissionState::ARMING:
+                        {
+                            // Arming을 위한 변수들
+                            static int arming_attempts = 0;
+                            const int max_arming_attempts = 10; // 최대 10번 (5초) 시도
+                            
+                            RCLCPP_INFO_THROTTLE(
+                                this->get_logger(), 
+                                *this->get_clock(), 
+                                1000, 
+                                "State: ARMING (Attempt %d/%d)", 
+                                arming_attempts + 1, 
+                                max_arming_attempts
+                            );
 
+                            const auto arm_result = action_->arm();
+                            if (arm_result == mavsdk::Action::Result::Success) {
+                                RCLCPP_INFO(this->get_logger(), "Armed successfully.");
+                                current_state_ = MissionState::TAKING_OFF;
+                            } else {
+                                arming_attempts++;
+                                if (arming_attempts >= max_arming_attempts) {
+                                    current_state_ = MissionState::LANDING; 
+                                }
+                                // 실패 시 바로 다음 루프에서 재시도 (50ms 간격)
+                            }
+                        }
+                        break;
 
-                if (distance_to_target < acceptance_radius) {
-                    RCLCPP_INFO(this->get_logger(), "Reached setpoint %zu", curr_idx);
+                    case MissionState::TAKING_OFF:
+                        {
+                            static bool takeoff_triggered = false;
+                            // 타임아웃을 위한 시간 기록
+                            static std::chrono::steady_clock::time_point takeoff_start_time;
 
-                    std::this_thread::sleep_for(std::chrono::milliseconds(150)); 
-                    curr_idx++;
+                            if (!takeoff_triggered) {
+                                RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "State: TAKING_OFF - Sending command");
+                                action_->set_takeoff_altitude(height);
+                                const auto takeoff_result = action_->takeoff();
+                                if (takeoff_result == mavsdk::Action::Result::Success) {
+                                    RCLCPP_INFO(this->get_logger(), "Takeoff command sent.");
+                                    takeoff_triggered = true;
+                                    takeoff_start_time = std::chrono::steady_clock::now(); // 이륙 시작 시간 기록
+                                } else {
+                                    RCLCPP_ERROR(this->get_logger(), "Takeoff failed");
+                                    current_state_ = MissionState::LANDING;
+                                }
+                            } else {
+                                // 이륙 명령을 보낸 후
+                                float current_alt;
+                                bool in_air = telemetry_->in_air();
+                                {
+                                    std::lock_guard<std::mutex> lock(position_mutex_);
+                                    current_alt = current_relative_altitude_m_;
+                                }
+                                
+                                RCLCPP_INFO_THROTTLE(
+                                    this->get_logger(), *this->get_clock(), 1000, 
+                                    "State: TAKING_OFF - In air: %s, Altitude: %.2f / %.2f m", 
+                                    in_air ? "true" : "false", current_alt, height
+                                );
+                                
+                                // 조건 1: 목표 고도의 85% 이상에 도달했는가? (조건 완화)
+                                if (current_alt >= height * 0.85f && in_air) {
+                                    RCLCPP_INFO(this->get_logger(), "Takeoff complete. Reached altitude: %.2f m", current_alt);
+                                    current_state_ = MissionState::STARTING_OFFBOARD;
+                                }
 
-                    if (curr_idx >= figure8_path_.size()) {
-                        RCLCPP_INFO(this->get_logger(), "Completed one Figure 8 cycle. Restarting from beginning.");
-                        curr_idx = 0; 
-                    }
+                                // 조건 2: 이륙을 시작한 지 너무 오래되지는 않았는가? (타임아웃)
+                                auto elapsed = std::chrono::steady_clock::now() - takeoff_start_time;
+                                if (elapsed > std::chrono::seconds(30)) { // 30초 타임아웃
+                                    RCLCPP_ERROR(this->get_logger(), "Takeoff timeout! Failed to reach altitude.");
+                                    current_state_ = MissionState::LANDING;
+                                }
+                            }
+                        }
+                        break;
+
+                    case MissionState::STARTING_OFFBOARD:
+                        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "State: STARTING_OFFBOARD");
+                        
+                        // Offboard 모드 시작 전, 현재 위치를 유지하도록 초기 Setpoint를 몇 번 보냅니다.
+                        // 이는 PX4가 Offboard 모드로 부드럽게 전환할 준비를 할 시간을 줍니다.
+                        {
+                            mavsdk::Offboard::PositionNedYaw initial_setpoint{};
+                            initial_setpoint.north_m = current_north_m_; // 현재 위치를 목표로 설정
+                            initial_setpoint.east_m = current_east_m_;
+                            initial_setpoint.down_m = -height;
+                            initial_setpoint.yaw_deg = telemetry_->attitude_euler().yaw_deg;
+                            offboard_->set_position_ned(initial_setpoint);
+                        }
+
+                        // EKF가 위치를 확실히 인지할 시간을 주기 위해 짧은 대기
+                        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+                        {
+                            auto offboard_start_result = offboard_->start();
+                            if (offboard_start_result == mavsdk::Offboard::Result::Success) {
+                                RCLCPP_INFO(this->get_logger(), "Offboard mode started successfully.");
+                                
+                                // Offboard 시작 후, 실제로 비행 작업을 시작하기 전에
+                                // 현재 위치를 유지하는 명령을 보내며 잠시 대기합니다.
+                                // 이 과정이 PX4가 FlightTaskOffboard를 활성화하는 데 매우 중요합니다.
+                                static bool stabilized = false;
+                                static std::chrono::steady_clock::time_point start_time;
+                                if (!stabilized) {
+                                    start_time = std::chrono::steady_clock::now();
+                                    stabilized = true;
+                                }
+
+                                if (std::chrono::steady_clock::now() - start_time > std::chrono::seconds(2)) {
+                                    RCLCPP_INFO(this->get_logger(), "Offboard stabilized. Starting Figure 8 path.");
+                                    figure8_path_generator(); // 경로 생성은 여기서 한 번만
+                                    current_state_ = MissionState::FLYING_FIGURE8;
+                                }
+
+                            } else {
+                                
+                                current_state_ = MissionState::LANDING;
+                            }
+                        }
+                        break;
+
+                    case MissionState::FLYING_FIGURE8:
+                        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "State: FLYING_FIGURE8 - To Waypoint %zu", figure8_idx);
+                        {
+                            const auto& target_point = figure8_path_[figure8_idx];
+                            offboard_->set_position_ned(target_point);
+
+                            float current_n, current_e;
+                            {
+                                std::lock_guard<std::mutex> lock(position_mutex_);
+                                current_n = current_north_m_;
+                                current_e = current_east_m_;
+                            }
+
+                            // 수평 거리만 계산하여 웨이포인트 도달 여부 판단
+                            float distance_to_target = std::sqrt(
+                                std::pow(current_n - target_point.north_m, 2) +
+                                std::pow(current_e - target_point.east_m, 2)
+                            );
+
+                            if (distance_to_target < acceptance_radius) {
+                                RCLCPP_INFO(this->get_logger(), "Reached setpoint %zu", figure8_idx);
+                                figure8_idx++;
+                                if (figure8_idx >= figure8_path_.size()) {
+                                    RCLCPP_INFO(this->get_logger(), "Figure 8 cycle complete. Landing.");
+                                    current_state_ = MissionState::LANDING;
+                                }
+                            }
+                        }
+                        break;
+
+                    case MissionState::LANDING:
+                        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "State: LANDING");
+                        {
+                            static bool land_triggered = false;
+                            if (!land_triggered) {
+                                if (offboard_->is_active()) {
+                                    offboard_->stop();
+                                    RCLCPP_INFO(this->get_logger(), "Offboard mode stopped for landing.");
+                                }
+                                const auto land_result = action_->land();
+                                if (land_result == mavsdk::Action::Result::Success) {
+                                    RCLCPP_INFO(this->get_logger(), "Landing command sent.");
+                                    land_triggered = true;
+                                } else {
+                                    RCLCPP_ERROR(this->get_logger(), "Landing failed");
+                                }
+                            }
+                            
+                            if (!telemetry_->in_air()) {
+                                RCLCPP_INFO(this->get_logger(), "Landed.");
+                                const auto disarm_result = action_->disarm();
+                                if (disarm_result == mavsdk::Action::Result::Success) {
+                                    RCLCPP_INFO(this->get_logger(), "Disarmed.");
+                                }
+                                current_state_ = MissionState::FINISHED;
+                            }
+                        }
+                        break;
+                    
+                    default:
+                        // 혹시 모를 예외 상황
+                        break;
                 }
 
-                std::this_thread::sleep_for(std::chrono::milliseconds(50));
-
-            }
-            // 루프 종료 시 (rclcpp::ok()가 false이거나 emergency_triggered_가 true)
-            RCLCPP_INFO(this->get_logger(), "Figure 8 mission loop ended. Proceeding to landing.");
-            
-            // Offboard 모드 중지 (명시적으로 중지하는 것이 좋음)
-            if (offboard_->is_active()) {
-                RCLCPP_INFO(this->get_logger(), "Stopping Offboard mode explicitly.");
-                auto stop_result = offboard_->stop();
-                if (stop_result != mavsdk::Offboard::Result::Success) {
-                    RCLCPP_ERROR(this->get_logger(), "Failed to stop offboard mode gracefully");
-                }
+                // 루프는 항상 일정한 주기로 돌아야 합니다. Offboard 타임아웃 방지.
+                std::this_thread::sleep_for(std::chrono::milliseconds(50)); // 20Hz
             }
 
-            goto land_sequence;
-
-
-        land_sequence: // 착륙 시퀀스 시작점
-            if (emergency_triggered_) {
-                RCLCPP_WARN(this->get_logger(), "Emergency Land initiated!");
-            }
-
-            // 5. Landing
-            RCLCPP_INFO(this->get_logger(), "Landing...");
-            const mavsdk::Action::Result land_result = action_->land();
-            if (land_result != mavsdk::Action::Result::Success) {
-                RCLCPP_ERROR(this->get_logger(), "Landing failed");
-                // 실패해도 일단 계속 진행하여 종료 시도
-            }
-
-            // 착륙 완료 대기
-            while (telemetry_->in_air()) {
-                RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "Waiting for landing to complete...");
-                std::this_thread::sleep_for(std::chrono::seconds(1));
-                if (emergency_triggered_ && !telemetry_->in_air()){ // 이미 착륙했는데 비상 플래그가 켜진 경우
-                    break;
-                }
-            }
-            RCLCPP_INFO(this->get_logger(), "Landed.");
-
-            // Disarm
-            RCLCPP_INFO(this->get_logger(), "Disarming...");
-            const mavsdk::Action::Result disarm_result = action_->disarm();
-            if (disarm_result != mavsdk::Action::Result::Success) {
-                RCLCPP_ERROR(this->get_logger(), "Disarming failed");
-            } else {
-                RCLCPP_INFO(this->get_logger(), "Disarmed.");
-            }
-
-
-            RCLCPP_INFO(this->get_logger(), "Mission complete.");
-            rclcpp::shutdown(); // ROS 노드 종료
+            // --- 5. 루프 종료 후 정리 ---
+            RCLCPP_INFO(this->get_logger(), "Mission thread finished.");
+            rclcpp::shutdown();
         }
+
+
 };
 
 
